@@ -8,15 +8,60 @@ export default function Home() {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [fileName, setFileName] = useState("");
-  const [pageImages, setPageImages] = useState({});
-  const [translations, setTranslations] = useState({});
+  const [pageImages, setPageImages] = useState({});       // raw page images
+  const [overlayImages, setOverlayImages] = useState({}); // translated overlay images
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
-  const canvasRef = useRef(null);
+  const [showOriginal, setShowOriginal] = useState(false);
   const fileInputRef = useRef(null);
+  const hiddenCanvasRef = useRef(null);
 
-  // Tesseract worker — on demand හදනවා, useEffect නෑ
-  const getWorker = useCallback(async () => {
+  // ── helpers ──────────────────────────────────────────────
+
+  async function translateText(text) {
+    if (!text?.trim()) return "";
+    try {
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, source: "en", target: "si" }),
+      });
+      const d = await res.json();
+      return d.translation || text;
+    } catch {
+      return text;
+    }
+  }
+
+  function wrapText(ctx, text, x, y, maxWidth, lineHeight) {
+    const words = text.split(" ");
+    let line = "";
+    const lines = [];
+    for (const word of words) {
+      const test = line ? line + " " + word : word;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = test;
+      }
+    }
+    if (line) lines.push(line);
+
+    const totalH = lines.length * lineHeight;
+    let startY = y - totalH / 2 + lineHeight / 2;
+
+    for (const l of lines) {
+      ctx.fillText(l, x, startY);
+      startY += lineHeight;
+    }
+  }
+
+  // ── OCR + overlay ─────────────────────────────────────────
+
+  const buildOverlay = useCallback(async (imgData, pageNum) => {
+    setStatus("📖 Speech bubbles හොයනවා...");
+
     const { createWorker } = await import("tesseract.js");
     const worker = await createWorker("eng", 1, {
       logger: () => {},
@@ -24,270 +69,204 @@ export default function Home() {
       corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5/tesseract-core-simd-lstm.wasm.js",
       langPath: "https://tessdata.projectnaptha.com/4.0.0",
     });
-    return worker;
-  }, []);
 
-  const renderPageToCanvas = useCallback(async (doc, pageNum) => {
-    const page = await doc.getPage(pageNum);
-    const viewport = page.getViewport({ scale: 2.0 });
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
-    const ctx = canvas.getContext("2d");
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    return canvas.toDataURL("image/jpeg", 0.9);
-  }, []);
+    // PSM 11 = sparse text, gets individual text blocks
+    await worker.setParameters({ tessedit_pageseg_mode: "11" });
+    const { data } = await worker.recognize(imgData);
+    await worker.terminate();
 
-  const ocrAndTranslate = useCallback(async (imgData, pageNum) => {
-    // Step 1: OCR
-    setStatus("📖 Text හොයනවා...");
-    let extractedText = "";
+    // Get paragraph-level blocks with bounding boxes
+    const blocks = data.blocks || [];
 
-    try {
-      const worker = await getWorker();
-      const { data } = await worker.recognize(imgData);
-      extractedText = data.text?.trim() || "";
-      await worker.terminate();
-    } catch (e) {
-      console.error("OCR error:", e);
-    }
-
-    if (!extractedText || extractedText.length < 4) {
-      setTranslations((prev) => ({
-        ...prev,
-        [pageNum]: "(පිටුවේ හඳුනාගත හැකි text නොමැත)",
-      }));
+    if (!blocks.length) {
+      setOverlayImages((prev) => ({ ...prev, [pageNum]: imgData }));
       return;
     }
 
-    // Step 2: Clean
-    const clean = extractedText
-      .replace(/[^\x20-\x7E\n]/g, " ")
-      .replace(/[ \t]{2,}/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-
-    // Step 3: Translate via proxy
     setStatus("🌐 සිංහලට translate කරනවා...");
 
-    const chunks = splitChunks(clean, 800);
-    const results = [];
+    // Load original image onto hidden canvas
+    const img = await new Promise((res) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.src = imgData;
+    });
 
-    for (const chunk of chunks) {
-      try {
-        const res = await fetch("/api/translate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: chunk, source: "en", target: "si" }),
-        });
-        const data = await res.json();
-        results.push(data.translation || `[error: ${data.error}]`);
-      } catch (e) {
-        results.push(`[translate failed: ${e.message}]`);
-      }
+    const canvas = hiddenCanvasRef.current;
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    // Scale factor (OCR runs on original, canvas may differ)
+    const scaleX = img.width / img.width;
+    const scaleY = img.height / img.height;
+
+    // Translate each block and overlay
+    for (const block of blocks) {
+      const text = block.text?.trim();
+      if (!text || text.length < 2) continue;
+
+      const { x0, y0, x1, y1 } = block.bbox;
+      const bx = x0 * scaleX;
+      const by = y0 * scaleY;
+      const bw = (x1 - x0) * scaleX;
+      const bh = (y1 - y0) * scaleY;
+
+      if (bw < 20 || bh < 10) continue;
+
+      const translated = await translateText(text);
+      if (!translated) continue;
+
+      // White bubble background
+      ctx.fillStyle = "rgba(255,255,255,0.92)";
+      ctx.beginPath();
+      const r = Math.min(bw, bh) * 0.15;
+      ctx.roundRect(bx, by, bw, bh, r);
+      ctx.fill();
+
+      // Thin border
+      ctx.strokeStyle = "rgba(0,0,0,0.15)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      // Sinhala text
+      const fontSize = Math.max(11, Math.min(bh * 0.38, 18));
+      ctx.font = `${fontSize}px sans-serif`;
+      ctx.fillStyle = "#111";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+
+      const cx = bx + bw / 2;
+      const cy = by + bh / 2;
+      wrapText(ctx, translated, cx, cy, bw - 8, fontSize * 1.4);
     }
 
-    setTranslations((prev) => ({
-      ...prev,
-      [pageNum]: results.join("\n\n"),
-    }));
-  }, [getWorker]);
+    const overlayData = canvas.toDataURL("image/jpeg", 0.92);
+    setOverlayImages((prev) => ({ ...prev, [pageNum]: overlayData }));
+  }, []);
 
-  function splitChunks(text, max) {
-    const lines = text.split(/\n+/);
-    const chunks = [];
-    let cur = "";
-    for (const line of lines) {
-      if ((cur + "\n" + line).length > max) {
-        if (cur) chunks.push(cur.trim());
-        cur = line;
-      } else {
-        cur += (cur ? "\n" : "") + line;
-      }
-    }
-    if (cur.trim()) chunks.push(cur.trim());
-    return chunks.length ? chunks : [text.slice(0, max)];
-  }
+  // ── page rendering ────────────────────────────────────────
 
-  const goToPage = useCallback(
-    async (pageNum, doc) => {
-      const d = doc || pdfDoc;
-      if (!d || pageNum < 1 || pageNum > totalPages || busy) return;
+  const renderAndProcess = useCallback(async (doc, pageNum) => {
+    setBusy(true);
+    setStatus("📄 Page render කරනවා...");
 
-      setBusy(true);
-      setCurrentPage(pageNum);
-      setStatus("📄 Page render කරනවා...");
+    try {
+      let imgData = pageImages[pageNum];
 
-      try {
-        // Render
-        let imgData = pageImages[pageNum];
-        if (!imgData) {
-          imgData = await renderPageToCanvas(d, pageNum);
-          if (imgData) {
-            setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
-          }
-        } else {
-          // Draw cached image onto canvas
-          await new Promise((resolve) => {
-            const img = new Image();
-            img.onload = () => {
-              const canvas = canvasRef.current;
-              if (canvas) {
-                canvas.width = img.width;
-                canvas.height = img.height;
-                canvas.getContext("2d").drawImage(img, 0, 0);
-              }
-              resolve();
-            };
-            img.src = imgData;
-          });
-        }
-
-        // Translate if not cached
-        if (!translations[pageNum] && imgData) {
-          await ocrAndTranslate(imgData, pageNum);
-        }
-      } catch (err) {
-        setTranslations((prev) => ({
-          ...prev,
-          [pageNum]: `දෝෂයකි: ${err.message}`,
-        }));
-      }
-
-      setStatus("");
-      setBusy(false);
-    },
-    [pdfDoc, totalPages, busy, pageImages, translations, renderPageToCanvas, ocrAndTranslate]
-  );
-
-  const loadPDF = useCallback(
-    async (file) => {
-      if (!file || busy) return;
-      setBusy(true);
-      setStatus("📂 PDF load කරනවා...");
-
-      try {
-        const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-        GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
-
-        const arrayBuffer = await file.arrayBuffer();
-        const doc = await getDocument({ data: arrayBuffer }).promise;
-
-        const pages = doc.numPages;
-        setPdfDoc(doc);
-        setTotalPages(pages);
-        setFileName(file.name);
-        setCurrentPage(1);
-        setPageImages({});
-        setTranslations({});
-        setBusy(false);
-        setStatus("");
-
-        // goToPage with fresh doc reference
-        setBusy(true);
-        setStatus("📄 Page render කරනවා...");
-
-        const { getDocument: _g, GlobalWorkerOptions: _gw, ...rest } = await import("pdfjs-dist");
-        const canvas = canvasRef.current;
-        const page = await doc.getPage(1);
+      if (!imgData) {
+        const page = await doc.getPage(pageNum);
         const viewport = page.getViewport({ scale: 2.0 });
-        if (canvas) {
-          canvas.height = viewport.height;
-          canvas.width = viewport.width;
-          await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-        }
-        const imgData = canvas ? canvas.toDataURL("image/jpeg", 0.9) : null;
-        if (imgData) {
-          setPageImages({ 1: imgData });
-          await ocrAndTranslate(imgData, 1);
-        }
-      } catch (err) {
-        setStatus(`දෝෂයකි: ${err.message}`);
+        const canvas = hiddenCanvasRef.current;
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+        const ctx = canvas.getContext("2d");
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        imgData = canvas.toDataURL("image/jpeg", 0.92);
+        setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
       }
 
-      setStatus("");
+      if (!overlayImages[pageNum]) {
+        await buildOverlay(imgData, pageNum);
+      }
+    } catch (err) {
+      setStatus(`දෝෂය: ${err.message}`);
+    }
+
+    setStatus("");
+    setBusy(false);
+  }, [pageImages, overlayImages, buildOverlay]);
+
+  const goToPage = useCallback(async (num, doc) => {
+    const d = doc || pdfDoc;
+    if (!d || num < 1 || num > totalPages || busy) return;
+    setCurrentPage(num);
+    await renderAndProcess(d, num);
+  }, [pdfDoc, totalPages, busy, renderAndProcess]);
+
+  const loadPDF = useCallback(async (file) => {
+    if (!file || busy) return;
+    setBusy(true);
+    setStatus("📂 PDF load කරනවා...");
+
+    try {
+      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
+      const buf = await file.arrayBuffer();
+      const doc = await getDocument({ data: buf }).promise;
+
+      setPdfDoc(doc);
+      setTotalPages(doc.numPages);
+      setFileName(file.name);
+      setCurrentPage(1);
+      setPageImages({});
+      setOverlayImages({});
       setBusy(false);
-    },
-    [busy, ocrAndTranslate]
-  );
 
-  const handleDrop = (e) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file?.type === "application/pdf") loadPDF(file);
-  };
+      await renderAndProcess(doc, 1);
+    } catch (err) {
+      setStatus(`දෝෂය: ${err.message}`);
+      setBusy(false);
+    }
+  }, [busy, renderAndProcess]);
 
-  const translationText = translations[currentPage];
+  // ── UI ────────────────────────────────────────────────────
+
+  const displayImg = showOriginal
+    ? pageImages[currentPage]
+    : overlayImages[currentPage] || pageImages[currentPage];
 
   return (
     <div className={styles.container}>
+      <canvas ref={hiddenCanvasRef} style={{ display: "none" }} />
+
       {!pdfDoc ? (
         <div className={styles.uploadScreen}>
           <div
             className={styles.uploadZone}
             onClick={() => fileInputRef.current?.click()}
             onDragOver={(e) => e.preventDefault()}
-            onDrop={handleDrop}
+            onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f?.type === "application/pdf") loadPDF(f); }}
           >
             <div className={styles.uploadIcon}>📖</div>
             <h1 className={styles.uploadTitle}>Manga සිංහල පරිවර්තකය</h1>
             <p className={styles.uploadSub}>
-              PDF upload කරන්න — API key නෑ, සම්පූර්ණයෙන්ම free!
+              Speech bubbles සිංහලට — image එකේ මතම!
               <br />
               <span className={styles.techNote}>Tesseract OCR + Google Translate</span>
             </p>
             <div className={styles.uploadBtn}>PDF තෝරන්න</div>
           </div>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".pdf"
-            style={{ display: "none" }}
-            onChange={(e) => {
-              const f = e.target.files[0];
-              if (f) loadPDF(f);
-            }}
-          />
+          <input ref={fileInputRef} type="file" accept=".pdf" style={{ display: "none" }}
+            onChange={(e) => { const f = e.target.files[0]; if (f) loadPDF(f); }} />
         </div>
       ) : (
         <div className={styles.readerScreen}>
           <div className={styles.topBar}>
-            <button
-              className={styles.iconBtn}
-              onClick={() => {
-                setPdfDoc(null);
-                setFileName("");
-                setCurrentPage(1);
-                setTotalPages(0);
-                setPageImages({});
-                setTranslations({});
-                setBusy(false);
-                setStatus("");
-              }}
-            >
-              ←
-            </button>
+            <button className={styles.iconBtn} onClick={() => {
+              setPdfDoc(null); setFileName(""); setCurrentPage(1);
+              setTotalPages(0); setPageImages({}); setOverlayImages({});
+              setBusy(false); setStatus("");
+            }}>←</button>
+
             <span className={styles.fileLabel}>
-              {fileName.length > 25 ? fileName.slice(0, 25) + "..." : fileName}
+              {fileName.length > 20 ? fileName.slice(0, 20) + "..." : fileName}
             </span>
-            <span className={styles.pageBadge}>
-              {currentPage} / {totalPages}
-            </span>
+
+            <span className={styles.pageBadge}>{currentPage} / {totalPages}</span>
+
             <button
-              className={styles.iconBtn}
-              disabled={currentPage <= 1 || busy}
-              onClick={() => goToPage(currentPage - 1)}
+              className={`${styles.toggleBtn} ${showOriginal ? styles.toggleActive : ""}`}
+              onClick={() => setShowOriginal((v) => !v)}
             >
-              ‹
+              {showOriginal ? "Original" : "සිංහල"}
             </button>
-            <button
-              className={styles.iconBtn}
-              disabled={currentPage >= totalPages || busy}
-              onClick={() => goToPage(currentPage + 1)}
-            >
-              ›
-            </button>
+
+            <button className={styles.iconBtn} disabled={currentPage <= 1 || busy}
+              onClick={() => goToPage(currentPage - 1)}>‹</button>
+            <button className={styles.iconBtn} disabled={currentPage >= totalPages || busy}
+              onClick={() => goToPage(currentPage + 1)}>›</button>
           </div>
 
           {status && (
@@ -296,29 +275,15 @@ export default function Home() {
             </div>
           )}
 
-          <div className={styles.readerBody}>
-            <div className={styles.pagePanel}>
-              <canvas ref={canvasRef} className={styles.pageCanvas} />
-            </div>
-            <div className={styles.transPanel}>
-              <div className={styles.transPanelHead}>
-                <span className={styles.transHeadLabel}>සිංහල පරිවර්තනය</span>
-                {busy && <span className={styles.busyDot} />}
-                {!busy && translationText && <span className={styles.doneTag}>✓</span>}
+          <div className={styles.pageViewer}>
+            {displayImg ? (
+              <img src={displayImg} alt={`Page ${currentPage}`} className={styles.pageImg} />
+            ) : (
+              <div className={styles.pageLoading}>
+                <div className={styles.spinner} />
+                <p>{status || "load වෙමින්..."}</p>
               </div>
-              <div className={styles.transBody}>
-                {busy && !translationText ? (
-                  <div className={styles.transWaiting}>
-                    <div className={styles.spinner} />
-                    <p>{status || "සකස් වෙමින්..."}</p>
-                  </div>
-                ) : translationText ? (
-                  <pre className={styles.transText}>{translationText}</pre>
-                ) : (
-                  <p className={styles.transHint}>පිටුව load වෙමින්...</p>
-                )}
-              </div>
-            </div>
+            )}
           </div>
         </div>
       )}

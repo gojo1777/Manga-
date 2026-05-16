@@ -10,103 +10,163 @@ export default function Home() {
   const [fileName, setFileName] = useState("");
   const [pageImages, setPageImages] = useState({});
   const [translations, setTranslations] = useState({});
-  const [loadingTranslation, setLoadingTranslation] = useState(false);
-  const [renderingPage, setRenderingPage] = useState(false);
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
-  const translateAbortRef = useRef(null);
+  const workerRef = useRef(null);
 
-  const renderPage = useCallback(
-    async (doc, pageNum) => {
-      if (!doc) return;
-      setRenderingPage(true);
-      try {
-        const page = await doc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 1.8 });
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext("2d");
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        const imgData = canvas.toDataURL("image/jpeg", 0.85);
-        setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
-        return imgData;
-      } finally {
-        setRenderingPage(false);
+  // Tesseract worker init
+  useEffect(() => {
+    let cancelled = false;
+    async function initWorker() {
+      const { createWorker } = await import("tesseract.js");
+      const w = await createWorker("eng", 1, {
+        logger: () => {},
+      });
+      if (!cancelled) workerRef.current = w;
+    }
+    initWorker();
+    return () => {
+      cancelled = true;
+      workerRef.current?.terminate();
+    };
+  }, []);
+
+  const renderPageToCanvas = useCallback(async (doc, pageNum) => {
+    const page = await doc.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 2.0 });
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    const ctx = canvas.getContext("2d");
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return canvas.toDataURL("image/jpeg", 0.9);
+  }, []);
+
+  const ocrAndTranslate = useCallback(async (imgData, pageNum) => {
+    setBusy(true);
+
+    try {
+      // Step 1: OCR
+      setStatus("📖 Text හොයනවා (OCR)...");
+      let extractedText = "";
+
+      if (workerRef.current) {
+        const { data } = await workerRef.current.recognize(imgData);
+        extractedText = data.text?.trim() || "";
       }
-    },
-    []
-  );
 
-  const translatePage = useCallback(
-    async (pageNum, imgData) => {
-      if (!imgData) return;
-      if (translations[pageNum]) return;
+      if (!extractedText || extractedText.length < 5) {
+        setTranslations((prev) => ({
+          ...prev,
+          [pageNum]: "(මෙම පිටුවේ text හොයාගත නොහැකි විය — cover හෝ image only page)",
+        }));
+        setStatus("");
+        setBusy(false);
+        return;
+      }
 
-      setLoadingTranslation(true);
-      try {
-        const base64 = imgData.split(",")[1];
+      // Step 2: Clean text
+      const cleanText = extractedText
+        .replace(/[^\x20-\x7E\n]/g, " ")
+        .replace(/\s{3,}/g, "\n")
+        .trim();
+
+      // Step 3: Google Translate via proxy
+      setStatus("🌐 සිංහලට translate කරනවා...");
+
+      // Long text chunk කරන්න (Google limit)
+      const chunks = splitIntoChunks(cleanText, 800);
+      const translatedChunks = [];
+
+      for (const chunk of chunks) {
         const res = await fetch("/api/translate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ imageBase64: base64 }),
+          body: JSON.stringify({ text: chunk, source: "en", target: "si" }),
         });
         const data = await res.json();
         if (data.translation) {
-          setTranslations((prev) => ({
-            ...prev,
-            [pageNum]: data.translation,
-          }));
+          translatedChunks.push(data.translation);
         } else {
-          setTranslations((prev) => ({
-            ...prev,
-            [pageNum]: `දෝෂයකි: ${data.error || "නොදන්නා දෝෂය"}`,
-          }));
+          translatedChunks.push(`[translate error: ${data.error}]`);
         }
-      } catch (err) {
-        setTranslations((prev) => ({
-          ...prev,
-          [pageNum]: `දෝෂයකි: ${err.message}`,
-        }));
-      } finally {
-        setLoadingTranslation(false);
       }
-    },
-    [translations]
-  );
+
+      const finalTranslation = translatedChunks.join("\n\n");
+      setTranslations((prev) => ({ ...prev, [pageNum]: finalTranslation }));
+      setStatus("");
+    } catch (err) {
+      setTranslations((prev) => ({
+        ...prev,
+        [pageNum]: `දෝෂයකි: ${err.message}`,
+      }));
+      setStatus("");
+    }
+
+    setBusy(false);
+  }, []);
+
+  function splitIntoChunks(text, maxLen) {
+    const sentences = text.split(/\n+/);
+    const chunks = [];
+    let current = "";
+    for (const s of sentences) {
+      if ((current + "\n" + s).length > maxLen) {
+        if (current) chunks.push(current.trim());
+        current = s;
+      } else {
+        current += (current ? "\n" : "") + s;
+      }
+    }
+    if (current.trim()) chunks.push(current.trim());
+    return chunks.length ? chunks : [text.slice(0, maxLen)];
+  }
 
   const goToPage = useCallback(
-    async (newPage, doc) => {
-      const docToUse = doc || pdfDoc;
-      if (!docToUse || newPage < 1 || newPage > totalPages) return;
-      setCurrentPage(newPage);
+    async (pageNum, doc) => {
+      const d = doc || pdfDoc;
+      if (!d || pageNum < 1 || pageNum > totalPages) return;
+      setCurrentPage(pageNum);
+      setBusy(true);
+      setStatus("📄 Page load කරනවා...");
 
-      let imgData = pageImages[newPage];
+      let imgData = pageImages[pageNum];
       if (!imgData) {
-        imgData = await renderPage(docToUse, newPage);
+        imgData = await renderPageToCanvas(d, pageNum);
+        setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
       } else {
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const img = new Image();
-          img.onload = () => {
-            const ctx = canvas.getContext("2d");
+        // Cached image canvas-ට draw කරන්න
+        const img = new Image();
+        img.onload = () => {
+          const canvas = canvasRef.current;
+          if (canvas) {
             canvas.width = img.width;
             canvas.height = img.height;
-            ctx.drawImage(img, 0, 0);
-          };
-          img.src = imgData;
-        }
+            canvas.getContext("2d").drawImage(img, 0, 0);
+          }
+        };
+        img.src = imgData;
       }
 
-      await translatePage(newPage, imgData);
+      if (!translations[pageNum]) {
+        await ocrAndTranslate(imgData, pageNum);
+      } else {
+        setBusy(false);
+        setStatus("");
+      }
     },
-    [pdfDoc, totalPages, pageImages, renderPage, translatePage]
+    [pdfDoc, totalPages, pageImages, translations, renderPageToCanvas, ocrAndTranslate]
   );
 
   const loadPDF = useCallback(
     async (file) => {
       if (!file) return;
+      setBusy(true);
+      setStatus("📂 PDF load කරනවා...");
+
       const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
       GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
 
@@ -125,11 +185,6 @@ export default function Home() {
     [goToPage]
   );
 
-  const handleFileChange = (e) => {
-    const file = e.target.files[0];
-    if (file) loadPDF(file);
-  };
-
   const handleDrop = (e) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
@@ -137,7 +192,6 @@ export default function Home() {
   };
 
   const translationText = translations[currentPage];
-  const currentImg = pageImages[currentPage];
 
   return (
     <div className={styles.container}>
@@ -152,7 +206,11 @@ export default function Home() {
             <div className={styles.uploadIcon}>📖</div>
             <h1 className={styles.uploadTitle}>Manga සිංහල පරිවර්තකය</h1>
             <p className={styles.uploadSub}>
-              PDF file upload කරන්න — pages automatically සිංහලට translate වේ
+              PDF upload කරන්න — API key නෑ, සම්පූර්ණයෙන්ම free!
+              <br />
+              <span className={styles.techNote}>
+                Tesseract OCR + Google Translate
+              </span>
             </p>
             <div className={styles.uploadBtn}>PDF තෝරන්න</div>
           </div>
@@ -161,14 +219,17 @@ export default function Home() {
             type="file"
             accept=".pdf"
             style={{ display: "none" }}
-            onChange={handleFileChange}
+            onChange={(e) => {
+              const f = e.target.files[0];
+              if (f) loadPDF(f);
+            }}
           />
         </div>
       ) : (
         <div className={styles.readerScreen}>
           <div className={styles.topBar}>
             <button
-              className={styles.resetBtn}
+              className={styles.iconBtn}
               onClick={() => {
                 setPdfDoc(null);
                 setFileName("");
@@ -176,68 +237,71 @@ export default function Home() {
                 setTotalPages(0);
                 setPageImages({});
                 setTranslations({});
+                setBusy(false);
+                setStatus("");
               }}
-            >
-              ← නැවත
-            </button>
-            <span className={styles.fileNameLabel} title={fileName}>
-              {fileName.length > 30 ? fileName.slice(0, 30) + "..." : fileName}
-            </span>
-            <span className={styles.pageBadge}>
-              {currentPage} / {totalPages}
-            </span>
-            <button
-              className={styles.navBtn}
-              disabled={currentPage <= 1 || loadingTranslation || renderingPage}
-              onClick={() => goToPage(currentPage - 1)}
+              title="නැවත"
             >
               ←
             </button>
+
+            <span className={styles.fileLabel}>
+              {fileName.length > 25
+                ? fileName.slice(0, 25) + "..."
+                : fileName}
+            </span>
+
+            <span className={styles.pageBadge}>
+              {currentPage} / {totalPages}
+            </span>
+
             <button
-              className={styles.navBtn}
-              disabled={
-                currentPage >= totalPages || loadingTranslation || renderingPage
-              }
+              className={styles.iconBtn}
+              disabled={currentPage <= 1 || busy}
+              onClick={() => goToPage(currentPage - 1)}
+            >
+              ‹
+            </button>
+            <button
+              className={styles.iconBtn}
+              disabled={currentPage >= totalPages || busy}
               onClick={() => goToPage(currentPage + 1)}
             >
-              →
+              ›
             </button>
           </div>
 
+          {status && (
+            <div className={styles.statusBar}>
+              <span className={styles.spinnerInline} /> {status}
+            </div>
+          )}
+
           <div className={styles.readerBody}>
+            {/* Original page */}
             <div className={styles.pagePanel}>
               <canvas ref={canvasRef} className={styles.pageCanvas} />
-              {renderingPage && (
-                <div className={styles.pageOverlay}>
-                  <div className={styles.spinner} />
-                </div>
-              )}
             </div>
 
+            {/* Translation */}
             <div className={styles.transPanel}>
-              <div className={styles.transPanelHeader}>
-                <span className={styles.transLabel}>සිංහල පරිවර්තනය</span>
-                {loadingTranslation && (
-                  <span className={styles.translatingBadge}>
-                    <div className={styles.spinnerSmall} /> පරිවර්තනය වෙමින්...
-                  </span>
-                )}
-                {translationText && !loadingTranslation && (
-                  <span className={styles.doneBadge}>✓ සූදානම්</span>
+              <div className={styles.transPanelHead}>
+                <span className={styles.transHeadLabel}>සිංහල පරිවර්තනය</span>
+                {busy && <span className={styles.busyDot} />}
+                {!busy && translationText && (
+                  <span className={styles.doneTag}>✓</span>
                 )}
               </div>
-              <div className={styles.transContent}>
-                {loadingTranslation && !translationText ? (
-                  <div className={styles.transLoading}>
+              <div className={styles.transBody}>
+                {busy && !translationText ? (
+                  <div className={styles.transWaiting}>
                     <div className={styles.spinner} />
-                    <p>AI සිංහලට පරිවර්තනය කරමින්...</p>
+                    <p>{status || "සකස් වෙමින්..."}</p>
                   </div>
                 ) : translationText ? (
                   <pre className={styles.transText}>{translationText}</pre>
                 ) : (
-                  <p className={styles.transPlaceholder}>
-                    page render වෙමින්...
-                  </p>
+                  <p className={styles.transHint}>පිටුව load වෙමින්...</p>
                 )}
               </div>
             </div>

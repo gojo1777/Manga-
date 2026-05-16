@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback } from "react";
 import styles from "./page.module.css";
 
 export default function Home() {
@@ -14,23 +14,17 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
-  const workerRef = useRef(null);
 
-  // Tesseract worker init
-  useEffect(() => {
-    let cancelled = false;
-    async function initWorker() {
-      const { createWorker } = await import("tesseract.js");
-      const w = await createWorker("eng", 1, {
-        logger: () => {},
-      });
-      if (!cancelled) workerRef.current = w;
-    }
-    initWorker();
-    return () => {
-      cancelled = true;
-      workerRef.current?.terminate();
-    };
+  // Tesseract worker — on demand හදනවා, useEffect නෑ
+  const getWorker = useCallback(async () => {
+    const { createWorker } = await import("tesseract.js");
+    const worker = await createWorker("eng", 1, {
+      logger: () => {},
+      workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js",
+      corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5/tesseract-core-simd-lstm.wasm.js",
+      langPath: "https://tessdata.projectnaptha.com/4.0.0",
+    });
+    return worker;
   }, []);
 
   const renderPageToCanvas = useCallback(async (doc, pageNum) => {
@@ -46,143 +40,176 @@ export default function Home() {
   }, []);
 
   const ocrAndTranslate = useCallback(async (imgData, pageNum) => {
-    setBusy(true);
+    // Step 1: OCR
+    setStatus("📖 Text හොයනවා...");
+    let extractedText = "";
 
     try {
-      // Step 1: OCR
-      setStatus("📖 Text හොයනවා (OCR)...");
-      let extractedText = "";
+      const worker = await getWorker();
+      const { data } = await worker.recognize(imgData);
+      extractedText = data.text?.trim() || "";
+      await worker.terminate();
+    } catch (e) {
+      console.error("OCR error:", e);
+    }
 
-      if (workerRef.current) {
-        const { data } = await workerRef.current.recognize(imgData);
-        extractedText = data.text?.trim() || "";
-      }
+    if (!extractedText || extractedText.length < 4) {
+      setTranslations((prev) => ({
+        ...prev,
+        [pageNum]: "(පිටුවේ හඳුනාගත හැකි text නොමැත)",
+      }));
+      return;
+    }
 
-      if (!extractedText || extractedText.length < 5) {
-        setTranslations((prev) => ({
-          ...prev,
-          [pageNum]: "(මෙම පිටුවේ text හොයාගත නොහැකි විය — cover හෝ image only page)",
-        }));
-        setStatus("");
-        setBusy(false);
-        return;
-      }
+    // Step 2: Clean
+    const clean = extractedText
+      .replace(/[^\x20-\x7E\n]/g, " ")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
 
-      // Step 2: Clean text
-      const cleanText = extractedText
-        .replace(/[^\x20-\x7E\n]/g, " ")
-        .replace(/\s{3,}/g, "\n")
-        .trim();
+    // Step 3: Translate via proxy
+    setStatus("🌐 සිංහලට translate කරනවා...");
 
-      // Step 3: Google Translate via proxy
-      setStatus("🌐 සිංහලට translate කරනවා...");
+    const chunks = splitChunks(clean, 800);
+    const results = [];
 
-      // Long text chunk කරන්න (Google limit)
-      const chunks = splitIntoChunks(cleanText, 800);
-      const translatedChunks = [];
-
-      for (const chunk of chunks) {
+    for (const chunk of chunks) {
+      try {
         const res = await fetch("/api/translate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ text: chunk, source: "en", target: "si" }),
         });
         const data = await res.json();
-        if (data.translation) {
-          translatedChunks.push(data.translation);
-        } else {
-          translatedChunks.push(`[translate error: ${data.error}]`);
-        }
+        results.push(data.translation || `[error: ${data.error}]`);
+      } catch (e) {
+        results.push(`[translate failed: ${e.message}]`);
       }
-
-      const finalTranslation = translatedChunks.join("\n\n");
-      setTranslations((prev) => ({ ...prev, [pageNum]: finalTranslation }));
-      setStatus("");
-    } catch (err) {
-      setTranslations((prev) => ({
-        ...prev,
-        [pageNum]: `දෝෂයකි: ${err.message}`,
-      }));
-      setStatus("");
     }
 
-    setBusy(false);
-  }, []);
+    setTranslations((prev) => ({
+      ...prev,
+      [pageNum]: results.join("\n\n"),
+    }));
+  }, [getWorker]);
 
-  function splitIntoChunks(text, maxLen) {
-    const sentences = text.split(/\n+/);
+  function splitChunks(text, max) {
+    const lines = text.split(/\n+/);
     const chunks = [];
-    let current = "";
-    for (const s of sentences) {
-      if ((current + "\n" + s).length > maxLen) {
-        if (current) chunks.push(current.trim());
-        current = s;
+    let cur = "";
+    for (const line of lines) {
+      if ((cur + "\n" + line).length > max) {
+        if (cur) chunks.push(cur.trim());
+        cur = line;
       } else {
-        current += (current ? "\n" : "") + s;
+        cur += (cur ? "\n" : "") + line;
       }
     }
-    if (current.trim()) chunks.push(current.trim());
-    return chunks.length ? chunks : [text.slice(0, maxLen)];
+    if (cur.trim()) chunks.push(cur.trim());
+    return chunks.length ? chunks : [text.slice(0, max)];
   }
 
   const goToPage = useCallback(
     async (pageNum, doc) => {
       const d = doc || pdfDoc;
-      if (!d || pageNum < 1 || pageNum > totalPages) return;
-      setCurrentPage(pageNum);
+      if (!d || pageNum < 1 || pageNum > totalPages || busy) return;
+
       setBusy(true);
-      setStatus("📄 Page load කරනවා...");
+      setCurrentPage(pageNum);
+      setStatus("📄 Page render කරනවා...");
 
-      let imgData = pageImages[pageNum];
-      if (!imgData) {
-        imgData = await renderPageToCanvas(d, pageNum);
-        setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
-      } else {
-        // Cached image canvas-ට draw කරන්න
-        const img = new Image();
-        img.onload = () => {
-          const canvas = canvasRef.current;
-          if (canvas) {
-            canvas.width = img.width;
-            canvas.height = img.height;
-            canvas.getContext("2d").drawImage(img, 0, 0);
+      try {
+        // Render
+        let imgData = pageImages[pageNum];
+        if (!imgData) {
+          imgData = await renderPageToCanvas(d, pageNum);
+          if (imgData) {
+            setPageImages((prev) => ({ ...prev, [pageNum]: imgData }));
           }
-        };
-        img.src = imgData;
+        } else {
+          // Draw cached image onto canvas
+          await new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => {
+              const canvas = canvasRef.current;
+              if (canvas) {
+                canvas.width = img.width;
+                canvas.height = img.height;
+                canvas.getContext("2d").drawImage(img, 0, 0);
+              }
+              resolve();
+            };
+            img.src = imgData;
+          });
+        }
+
+        // Translate if not cached
+        if (!translations[pageNum] && imgData) {
+          await ocrAndTranslate(imgData, pageNum);
+        }
+      } catch (err) {
+        setTranslations((prev) => ({
+          ...prev,
+          [pageNum]: `දෝෂයකි: ${err.message}`,
+        }));
       }
 
-      if (!translations[pageNum]) {
-        await ocrAndTranslate(imgData, pageNum);
-      } else {
-        setBusy(false);
-        setStatus("");
-      }
+      setStatus("");
+      setBusy(false);
     },
-    [pdfDoc, totalPages, pageImages, translations, renderPageToCanvas, ocrAndTranslate]
+    [pdfDoc, totalPages, busy, pageImages, translations, renderPageToCanvas, ocrAndTranslate]
   );
 
   const loadPDF = useCallback(
     async (file) => {
-      if (!file) return;
+      if (!file || busy) return;
       setBusy(true);
       setStatus("📂 PDF load කරනවා...");
 
-      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
+      try {
+        const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+        GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
 
-      const arrayBuffer = await file.arrayBuffer();
-      const doc = await getDocument({ data: arrayBuffer }).promise;
+        const arrayBuffer = await file.arrayBuffer();
+        const doc = await getDocument({ data: arrayBuffer }).promise;
 
-      setPdfDoc(doc);
-      setTotalPages(doc.numPages);
-      setFileName(file.name);
-      setCurrentPage(1);
-      setPageImages({});
-      setTranslations({});
+        const pages = doc.numPages;
+        setPdfDoc(doc);
+        setTotalPages(pages);
+        setFileName(file.name);
+        setCurrentPage(1);
+        setPageImages({});
+        setTranslations({});
+        setBusy(false);
+        setStatus("");
 
-      await goToPage(1, doc);
+        // goToPage with fresh doc reference
+        setBusy(true);
+        setStatus("📄 Page render කරනවා...");
+
+        const { getDocument: _g, GlobalWorkerOptions: _gw, ...rest } = await import("pdfjs-dist");
+        const canvas = canvasRef.current;
+        const page = await doc.getPage(1);
+        const viewport = page.getViewport({ scale: 2.0 });
+        if (canvas) {
+          canvas.height = viewport.height;
+          canvas.width = viewport.width;
+          await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+        }
+        const imgData = canvas ? canvas.toDataURL("image/jpeg", 0.9) : null;
+        if (imgData) {
+          setPageImages({ 1: imgData });
+          await ocrAndTranslate(imgData, 1);
+        }
+      } catch (err) {
+        setStatus(`දෝෂයකි: ${err.message}`);
+      }
+
+      setStatus("");
+      setBusy(false);
     },
-    [goToPage]
+    [busy, ocrAndTranslate]
   );
 
   const handleDrop = (e) => {
@@ -208,9 +235,7 @@ export default function Home() {
             <p className={styles.uploadSub}>
               PDF upload කරන්න — API key නෑ, සම්පූර්ණයෙන්ම free!
               <br />
-              <span className={styles.techNote}>
-                Tesseract OCR + Google Translate
-              </span>
+              <span className={styles.techNote}>Tesseract OCR + Google Translate</span>
             </p>
             <div className={styles.uploadBtn}>PDF තෝරන්න</div>
           </div>
@@ -240,21 +265,15 @@ export default function Home() {
                 setBusy(false);
                 setStatus("");
               }}
-              title="නැවත"
             >
               ←
             </button>
-
             <span className={styles.fileLabel}>
-              {fileName.length > 25
-                ? fileName.slice(0, 25) + "..."
-                : fileName}
+              {fileName.length > 25 ? fileName.slice(0, 25) + "..." : fileName}
             </span>
-
             <span className={styles.pageBadge}>
               {currentPage} / {totalPages}
             </span>
-
             <button
               className={styles.iconBtn}
               disabled={currentPage <= 1 || busy}
@@ -278,19 +297,14 @@ export default function Home() {
           )}
 
           <div className={styles.readerBody}>
-            {/* Original page */}
             <div className={styles.pagePanel}>
               <canvas ref={canvasRef} className={styles.pageCanvas} />
             </div>
-
-            {/* Translation */}
             <div className={styles.transPanel}>
               <div className={styles.transPanelHead}>
                 <span className={styles.transHeadLabel}>සිංහල පරිවර්තනය</span>
                 {busy && <span className={styles.busyDot} />}
-                {!busy && translationText && (
-                  <span className={styles.doneTag}>✓</span>
-                )}
+                {!busy && translationText && <span className={styles.doneTag}>✓</span>}
               </div>
               <div className={styles.transBody}>
                 {busy && !translationText ? (

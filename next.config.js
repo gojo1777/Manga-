@@ -4,6 +4,14 @@ const nextConfig = {
     config.resolve.alias.canvas = false;
     return config;
   },
+  async rewrites() {
+    return [
+      {
+        source: "/gtranslate/:path*",
+        destination: "https://translate.googleapis.com/:path*",
+      },
+    ];
+  },
 };
 
 module.exports = nextConfig;
